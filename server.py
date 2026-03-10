@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+import logging
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -11,6 +12,10 @@ import replicate
 from dotenv import load_dotenv
 
 load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("replicate_compat")
 
 app = FastAPI()
 
@@ -51,15 +56,19 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
 def get_replicate_token(request: Request):
     auth = request.headers.get("Authorization")
     if not auth or not auth.startswith("Bearer "):
+        logger.warning("Authorization header missing or invalid format")
         raise HTTPException(status_code=401, detail="Unauthorized")
     api_token = auth.split(" ", 1)[1].strip()
     if not api_token:
+        logger.warning("Authorization token empty")
         raise HTTPException(status_code=401, detail="Unauthorized")
+    logger.info("Replicate token provided")
     os.environ["REPLICATE_API_TOKEN"] = api_token
     return api_token
 
 @app.get("/v1/models")
 def list_models(_: Any = Depends(get_replicate_token)):
+    logger.info("GET /v1/models")
     data = {
         "object": "list",
         "data": [
@@ -75,11 +84,16 @@ def list_models(_: Any = Depends(get_replicate_token)):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
+    logger.info("POST /v1/chat/completions")
+    logger.debug(f"Request body: {json.dumps({k: v for k, v in req.dict().items() if v is not None})}")
     if not req.messages and (req.prompt is None or req.prompt == ""):
+        logger.warning("Invalid input: no messages or prompt")
         raise HTTPException(status_code=400, detail="Harus menyediakan messages atau prompt")
     replicate_input = build_replicate_input(req)
+    logger.debug(f"Replicate input: {json.dumps(replicate_input)}")
     model = req.model or MODEL_ID
     if req.stream:
+        logger.info("Streaming response enabled")
         def event_generator():
             rid = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
@@ -122,6 +136,7 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
                 yield f"data: {json.dumps(end_data)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
+                logger.exception("Streaming error")
                 status = 500
                 msg = str(e)
                 lower = msg.lower()
@@ -135,9 +150,11 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
                 yield f"data: {json.dumps(err)}\n\n"
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     else:
+        logger.info("Non-stream response")
         try:
             output = replicate.run(model, input=replicate_input)
         except Exception as e:
+            logger.exception("Replicate run error")
             msg = str(e)
             lower = msg.lower()
             status = 500
@@ -151,6 +168,8 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
         rid = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         content = output if isinstance(output, str) else str(output)
+        logger.debug(f"Output type: {type(output).__name__}")
+        logger.debug(f"Output length: {len(content) if isinstance(content, str) else 'n/a'}")
         resp = {
             "id": rid,
             "object": "chat.completion",
