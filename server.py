@@ -49,8 +49,10 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
         payload["reasoning_effort"] = req.reasoning_effort
     if req.verbosity:
         payload["verbosity"] = req.verbosity
-    if req.max_tokens:
-        payload["max_completion_tokens"] = req.max_tokens
+    if req.max_tokens is not None:
+        tokens = max(16, int(req.max_tokens))
+        payload["max_output_tokens"] = tokens
+        payload["max_completion_tokens"] = tokens
     return payload
 
 def get_replicate_token(request: Request):
@@ -158,9 +160,9 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
             msg = str(e)
             lower = msg.lower()
             status = 500
-            if "unauthorized" in lower or "401" in lower:
+            if "unauthorized" in lower or " 401 " in lower or "status\":401" in lower:
                 status = 401
-            elif "bad request" in lower or "422" in lower:
+            elif "bad request" in lower or " 400 " in lower or "invalid_request_error" in lower or "422" in lower:
                 status = 400
             elif "rate limit" in lower or "429" in lower:
                 status = 429
