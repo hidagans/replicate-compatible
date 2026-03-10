@@ -2,10 +2,11 @@ import os
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import logging
 
 from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import replicate
@@ -27,7 +28,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     model: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = None
+    messages: Optional[Union[str, List[ChatMessage]]] = None
     prompt: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -40,7 +41,16 @@ class ChatRequest(BaseModel):
 def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     if req.messages:
-        payload["messages"] = [m.dict() for m in req.messages]
+        if isinstance(req.messages, str):
+            try:
+                parsed = json.loads(req.messages)
+            except Exception:
+                raise HTTPException(status_code=400, detail="messages harus berupa array JSON valid")
+            if not isinstance(parsed, list):
+                raise HTTPException(status_code=400, detail="messages harus berupa array")
+            payload["messages"] = parsed
+        else:
+            payload["messages"] = [m.dict() for m in req.messages]
     elif req.prompt is not None:
         payload["prompt"] = req.prompt
     if req.image_input:
@@ -195,3 +205,38 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# Middleware untuk logging raw request body
+@app.middleware("http")
+async def log_requests_middleware(request: Request, call_next):
+    try:
+        body = await request.body()
+        if body:
+            snippet = body[:2000]
+            try:
+                logger.debug(f"Raw body: {snippet.decode('utf-8', errors='ignore')}")
+            except Exception:
+                logger.debug(f"Raw body bytes length: {len(snippet)}")
+    except Exception:
+        logger.debug("Tidak bisa membaca raw body")
+    response = await call_next(request)
+    return response
+
+# Handler untuk validation error (422) dari FastAPI/Pydantic
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.body()
+        body_text = body[:2000].decode("utf-8", errors="ignore") if body else ""
+    except Exception:
+        body_text = ""
+    logger.error(f"Validation error: {exc.errors()} | body: {body_text}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "message": "Request validation failed",
+                "details": exc.errors(),
+            }
+        },
+    )
