@@ -24,7 +24,7 @@ MODEL_ID = os.getenv("REPLICATE_MODEL_ID", "openai/gpt-5.2")
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any
 
 class ChatRequest(BaseModel):
     model: Optional[str] = None
@@ -48,9 +48,47 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
                 raise HTTPException(status_code=400, detail="messages harus berupa array JSON valid")
             if not isinstance(parsed, list):
                 raise HTTPException(status_code=400, detail="messages harus berupa array")
-            payload["messages"] = parsed
+            normalized = []
+            for m in parsed:
+                role = m.get("role")
+                content = m.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            t = part.get("type")
+                            if t in ("text", "input_text"):
+                                parts.append(part.get("text") or part.get("input_text") or "")
+                            elif t == "image_url":
+                                # gambar ditangani via image_input terpisah; skip di content
+                                continue
+                        elif isinstance(part, str):
+                            parts.append(part)
+                    content = "\n".join([p for p in parts if p])
+                elif not isinstance(content, str):
+                    content = str(content)
+                normalized.append({"role": role, "content": content})
+            payload["messages"] = normalized
         else:
-            payload["messages"] = [m.dict() for m in req.messages]
+            normalized = []
+            for m in req.messages:
+                content = m.content
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            t = part.get("type")
+                            if t in ("text", "input_text"):
+                                parts.append(part.get("text") or part.get("input_text") or "")
+                            elif t == "image_url":
+                                continue
+                        elif isinstance(part, str):
+                            parts.append(part)
+                    content = "\n".join([p for p in parts if p])
+                elif not isinstance(content, str):
+                    content = str(content)
+                normalized.append({"role": m.role, "content": content})
+            payload["messages"] = normalized
     elif req.prompt is not None:
         payload["prompt"] = req.prompt
     if req.image_input:
