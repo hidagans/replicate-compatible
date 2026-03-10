@@ -40,7 +40,7 @@ class ChatRequest(BaseModel):
 def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     if req.messages:
-        payload["messages"] = json.dumps([m.dict() for m in req.messages])
+        payload["messages"] = [m.dict() for m in req.messages]
     elif req.prompt is not None:
         payload["prompt"] = req.prompt
     if req.image_input:
