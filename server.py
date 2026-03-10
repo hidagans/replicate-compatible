@@ -75,6 +75,8 @@ def list_models(_: Any = Depends(get_replicate_token)):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
+    if not req.messages and (req.prompt is None or req.prompt == ""):
+        raise HTTPException(status_code=400, detail="Harus menyediakan messages atau prompt")
     replicate_input = build_replicate_input(req)
     model = req.model or MODEL_ID
     if req.stream:
@@ -120,14 +122,32 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
                 yield f"data: {json.dumps(end_data)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                err = {"error": {"message": str(e)}}
+                status = 500
+                msg = str(e)
+                lower = msg.lower()
+                if "unauthorized" in lower or "401" in lower:
+                    status = 401
+                elif "bad request" in lower or "422" in lower:
+                    status = 400
+                elif "rate limit" in lower or "429" in lower:
+                    status = 429
+                err = {"error": {"message": msg, "status": status}}
                 yield f"data: {json.dumps(err)}\n\n"
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     else:
         try:
             output = replicate.run(model, input=replicate_input)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            msg = str(e)
+            lower = msg.lower()
+            status = 500
+            if "unauthorized" in lower or "401" in lower:
+                status = 401
+            elif "bad request" in lower or "422" in lower:
+                status = 400
+            elif "rate limit" in lower or "429" in lower:
+                status = 429
+            raise HTTPException(status_code=status, detail=msg)
         rid = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         content = output if isinstance(output, str) else str(output)
