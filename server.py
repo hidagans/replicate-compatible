@@ -4,7 +4,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import replicate
@@ -48,14 +48,18 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
         payload["max_completion_tokens"] = req.max_tokens
     return payload
 
-def ensure_token():
-    token = os.getenv("REPLICATE_API_TOKEN")
-    if not token:
-        raise HTTPException(status_code=500, detail="REPLICATE_API_TOKEN tidak terpasang")
+def get_replicate_token(request: Request):
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    api_token = auth.split(" ", 1)[1].strip()
+    if not api_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    os.environ["REPLICATE_API_TOKEN"] = api_token
+    return api_token
 
 @app.get("/v1/models")
-def list_models():
-    ensure_token()
+def list_models(_: Any = Depends(get_replicate_token)):
     data = {
         "object": "list",
         "data": [
@@ -70,8 +74,7 @@ def list_models():
     return JSONResponse(data)
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, request: Request):
-    ensure_token()
+async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
     replicate_input = build_replicate_input(req)
     model = req.model or MODEL_ID
     if req.stream:
