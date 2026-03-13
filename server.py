@@ -103,13 +103,33 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
         if system_msg:
             payload["system"] = system_msg.strip()
         
+        # Some Anthropic models on Replicate (like claude-4.5-sonnet) require a 'prompt' field
+        # We'll build a prompt from messages as a fallback or primary field
+        prompt_parts = []
+        if system_msg:
+            prompt_parts.append(f"System: {system_msg.strip()}")
+        
+        for m in final_messages:
+            role_label = "Human" if m["role"] == "user" else "Assistant"
+            prompt_parts.append(f"{role_label}: {m['content']}")
+        
+        if prompt_parts:
+            # Format as a conversation
+            payload["prompt"] = "\n\n".join(prompt_parts) + "\n\nAssistant:"
+            
         if final_messages:
+            # Also keep messages for models that support it
             payload["messages"] = json.dumps(final_messages) if not isinstance(final_messages, str) else final_messages
         elif req.prompt:
             payload["prompt"] = req.prompt
             
         if req.max_tokens:
-            tokens = max(16, int(req.max_tokens))
+            tokens = int(req.max_tokens)
+            # Claude 4.5 Sonnet on Replicate requires min 1024
+            if "claude-4.5" in model_name:
+                tokens = max(1024, tokens)
+            else:
+                tokens = max(16, tokens)
             payload["max_tokens"] = tokens
         if req.temperature is not None:
             payload["temperature"] = req.temperature
