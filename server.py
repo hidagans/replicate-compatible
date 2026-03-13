@@ -29,7 +29,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: Optional[Union[str, List[ChatMessage]]] = None
-    system: Optional[str] = None  # Anthropic style
+    system: Optional[Any] = None  # Anthropic style, can be string or list of parts
     prompt: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -92,11 +92,25 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
 
     if is_anthropic:
         # Anthropic style: system prompt is separate
-        system_msg = req.system or ""
+        system_msg = ""
+        if req.system:
+            if isinstance(req.system, list):
+                parts = []
+                for part in req.system:
+                    if isinstance(part, dict):
+                        t = part.get("type")
+                        if t in ("text", "input_text"):
+                            parts.append(part.get("text") or part.get("input_text") or "")
+                    elif isinstance(part, str):
+                        parts.append(part)
+                system_msg = "\n".join([p for p in parts if p])
+            else:
+                system_msg = str(req.system)
+
         final_messages = []
         for m in messages_list:
             if m["role"] == "system":
-                system_msg += (m["content"] + "\n")
+                system_msg += ("\n" + m["content"])
             else:
                 final_messages.append(m)
         
