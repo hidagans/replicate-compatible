@@ -29,6 +29,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: Optional[Union[str, List[ChatMessage]]] = None
+    system: Optional[str] = None  # Anthropic style
     prompt: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -91,11 +92,11 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
 
     if is_anthropic:
         # Anthropic style: system prompt is separate
-        system_msg = ""
+        system_msg = req.system or ""
         final_messages = []
         for m in messages_list:
             if m["role"] == "system":
-                system_msg += m["content"] + "\n"
+                system_msg += (m["content"] + "\n")
             else:
                 final_messages.append(m)
         
@@ -270,6 +271,63 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
             },
         }
         return JSONResponse(resp)
+
+@app.post("/v1/messages")
+async def anthropic_messages(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
+    logger.info("POST /v1/messages (Anthropic style)")
+    model = req.model or MODEL_ID
+    replicate_input = build_replicate_input(req, model)
+    
+    if req.stream:
+        def event_generator():
+            msg_id = f"msg_{uuid.uuid4().hex}"
+            # Anthropic stream format is complex, we provide a simplified version that most clients can parse
+            # or map the Replicate stream to Anthropic events
+            try:
+                # 1. message_start
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+                
+                # 2. content_block_start
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                
+                for chunk in replicate.stream(model, input=replicate_input):
+                    token = chunk if isinstance(chunk, str) else str(chunk)
+                    # 3. content_block_delta
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': token}})}\n\n"
+                
+                # 4. content_block_stop
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                
+                # 5. message_delta
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+                
+                # 6. message_stop
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                
+            except Exception as e:
+                logger.exception("Anthropic streaming error")
+                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
+        
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+    else:
+        try:
+            output = replicate.run(model, input=replicate_input)
+            content = output if isinstance(output, str) else str(output)
+            
+            resp = {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": content}],
+                "model": model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+            return JSONResponse(resp)
+        except Exception as e:
+            logger.exception("Anthropic run error")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health():
