@@ -109,7 +109,8 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
             payload["prompt"] = req.prompt
             
         if req.max_tokens:
-            payload["max_tokens"] = max(1, int(req.max_tokens))
+            tokens = max(16, int(req.max_tokens))
+            payload["max_tokens"] = tokens
         if req.temperature is not None:
             payload["temperature"] = req.temperature
         if req.top_p is not None:
@@ -136,15 +137,27 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
     return payload
 
 def get_replicate_token(request: Request):
+    # Support multiple auth headers
+    # 1. OpenAI/standard Bearer token
     auth = request.headers.get("Authorization")
-    if not auth or not auth.startswith("Bearer "):
-        logger.warning("Authorization header missing or invalid format")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    api_token = auth.split(" ", 1)[1].strip()
+    api_token = None
+    
+    if auth and auth.startswith("Bearer "):
+        api_token = auth.split(" ", 1)[1].strip()
+    
+    # 2. Anthropic style x-api-key
     if not api_token:
-        logger.warning("Authorization token empty")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    logger.info("Replicate token provided")
+        api_token = request.headers.get("x-api-key")
+        
+    # 3. Fallback to anthropic-key or api-key
+    if not api_token:
+        api_token = request.headers.get("anthropic-key") or request.headers.get("api-key")
+        
+    if not api_token:
+        logger.warning(f"Authorization missing. Headers: {dict(request.headers)}")
+        raise HTTPException(status_code=401, detail="Unauthorized: No Replicate token found in headers (Authorization: Bearer, x-api-key, etc)")
+    
+    logger.info("Replicate token provided via headers")
     os.environ["REPLICATE_API_TOKEN"] = api_token
     return api_token
 
