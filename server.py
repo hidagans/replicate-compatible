@@ -38,8 +38,11 @@ class ChatRequest(BaseModel):
     verbosity: Optional[str] = None
     image_input: Optional[List[str]] = None
 
-def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
+def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
+    is_anthropic = model_name.startswith("anthropic/")
+    
+    messages_list = []
     if req.messages:
         if isinstance(req.messages, str):
             try:
@@ -48,7 +51,7 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
                 raise HTTPException(status_code=400, detail="messages harus berupa array JSON valid")
             if not isinstance(parsed, list):
                 raise HTTPException(status_code=400, detail="messages harus berupa array")
-            normalized = []
+            
             for m in parsed:
                 role = m.get("role")
                 content = m.get("content")
@@ -60,17 +63,14 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
                             if t in ("text", "input_text"):
                                 parts.append(part.get("text") or part.get("input_text") or "")
                             elif t == "image_url":
-                                # gambar ditangani via image_input terpisah; skip di content
                                 continue
                         elif isinstance(part, str):
                             parts.append(part)
                     content = "\n".join([p for p in parts if p])
                 elif not isinstance(content, str):
                     content = str(content)
-                normalized.append({"role": role, "content": content})
-            payload["messages"] = normalized
+                messages_list.append({"role": role, "content": content})
         else:
-            normalized = []
             for m in req.messages:
                 content = m.content
                 if isinstance(content, list):
@@ -87,20 +87,51 @@ def build_replicate_input(req: ChatRequest) -> Dict[str, Any]:
                     content = "\n".join([p for p in parts if p])
                 elif not isinstance(content, str):
                     content = str(content)
-                normalized.append({"role": m.role, "content": content})
-            payload["messages"] = normalized
-    elif req.prompt is not None:
-        payload["prompt"] = req.prompt
+                messages_list.append({"role": m.role, "content": content})
+
+    if is_anthropic:
+        # Anthropic style: system prompt is separate
+        system_msg = ""
+        final_messages = []
+        for m in messages_list:
+            if m["role"] == "system":
+                system_msg += m["content"] + "\n"
+            else:
+                final_messages.append(m)
+        
+        if system_msg:
+            payload["system"] = system_msg.strip()
+        
+        if final_messages:
+            payload["messages"] = json.dumps(final_messages) if not isinstance(final_messages, str) else final_messages
+        elif req.prompt:
+            payload["prompt"] = req.prompt
+            
+        if req.max_tokens:
+            payload["max_tokens"] = max(1, int(req.max_tokens))
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.top_p is not None:
+            payload["top_p"] = req.top_p
+    else:
+        # Default/OpenAI style on Replicate
+        if messages_list:
+            payload["messages"] = messages_list
+        elif req.prompt is not None:
+            payload["prompt"] = req.prompt
+            
+        if req.max_tokens is not None:
+            tokens = max(16, int(req.max_tokens))
+            payload["max_output_tokens"] = tokens
+            payload["max_completion_tokens"] = tokens
+            
     if req.image_input:
         payload["image_input"] = req.image_input
     if req.reasoning_effort:
         payload["reasoning_effort"] = req.reasoning_effort
     if req.verbosity:
         payload["verbosity"] = req.verbosity
-    if req.max_tokens is not None:
-        tokens = max(16, int(req.max_tokens))
-        payload["max_output_tokens"] = tokens
-        payload["max_completion_tokens"] = tokens
+        
     return payload
 
 def get_replicate_token(request: Request):
@@ -139,9 +170,9 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
     if not req.messages and (req.prompt is None or req.prompt == ""):
         logger.warning("Invalid input: no messages or prompt")
         raise HTTPException(status_code=400, detail="Harus menyediakan messages atau prompt")
-    replicate_input = build_replicate_input(req)
-    logger.debug(f"Replicate input: {json.dumps(replicate_input)}")
     model = req.model or MODEL_ID
+    replicate_input = build_replicate_input(req, model)
+    logger.debug(f"Replicate input: {json.dumps(replicate_input)}")
     if req.stream:
         logger.info("Streaming response enabled")
         def event_generator():
