@@ -22,6 +22,24 @@ app = FastAPI()
 
 MODEL_ID = os.getenv("REPLICATE_MODEL_ID", "openai/gpt-5.2")
 
+# Model Mapping - tambahkan pemetaan model OpenAI/Anthropic ke Replicate ID
+MODEL_MAP = {
+    "gpt-3.5-turbo": "meta/llama-2-7b-chat",
+    "gpt-4": "meta/llama-2-70b-chat",
+    "gpt-5.4": "openai/gpt-5.4", # Contoh mapping untuk model yang error
+}
+
+def resolve_model_id(m: Optional[str]) -> str:
+    m = m or MODEL_ID
+    # Cek di mapping
+    if m in MODEL_MAP:
+        return MODEL_MAP[m]
+    # Jika tidak ada owner (format owner/name), beri owner default
+    if "/" not in m:
+        default_owner = MODEL_ID.split("/")[0] if "/" in MODEL_ID else "openai"
+        return f"{default_owner}/{m}"
+    return m
+
 class ChatMessage(BaseModel):
     role: str
     content: Any
@@ -198,17 +216,26 @@ def get_replicate_token(request: Request):
 @app.get("/v1/models")
 def list_models(_: Any = Depends(get_replicate_token)):
     logger.info("GET /v1/models")
+    model_id = resolve_model_id(None)
     data = {
         "object": "list",
         "data": [
             {
-                "id": MODEL_ID,
+                "id": model_id,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "replicate",
             }
         ],
     }
+    # Tambahkan model lain dari MODEL_MAP
+    for k in MODEL_MAP.keys():
+        data["data"].append({
+            "id": k,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "mapping",
+        })
     return JSONResponse(data)
 
 @app.post("/v1/chat/completions")
@@ -218,7 +245,12 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
     if not req.messages and (req.prompt is None or req.prompt == ""):
         logger.warning("Invalid input: no messages or prompt")
         raise HTTPException(status_code=400, detail="Harus menyediakan messages atau prompt")
-    model = req.model or MODEL_ID
+    
+    model = resolve_model_id(req.model)
+    if "/" not in model:
+        logger.error(f"Invalid model format: {model}")
+        raise HTTPException(status_code=400, detail=f"Invalid model ID format: {model}. Expected 'owner/name'")
+        
     replicate_input = build_replicate_input(req, model)
     logger.debug(f"Replicate input: {json.dumps(replicate_input)}")
     if req.stream:
@@ -322,7 +354,11 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
 @app.post("/v1/messages")
 async def anthropic_messages(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
     logger.info("POST /v1/messages (Anthropic style)")
-    model = req.model or MODEL_ID
+    model = resolve_model_id(req.model)
+    if "/" not in model:
+        logger.error(f"Invalid model format (anthropic): {model}")
+        raise HTTPException(status_code=400, detail=f"Invalid model ID format: {model}. Expected 'owner/name'")
+        
     replicate_input = build_replicate_input(req, model)
     
     if req.stream:
