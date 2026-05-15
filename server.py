@@ -30,6 +30,13 @@ MODEL_MAP = {
     "gpt-3.5-turbo": "meta/llama-2-7b-chat",
     "gpt-4": "meta/llama-2-70b-chat",
     "gpt-5.4": "openai/gpt-5.4",
+    "deepseek-v3": "deepseek-ai/deepseek-v3",
+    "deepseek-ai/deepseek-v3": "deepseek-ai/deepseek-v3",
+}
+
+# Models that use a flat prompt string instead of a messages array
+_PROMPT_ONLY_MODELS = {
+    "deepseek-ai/deepseek-v3",
 }
 
 
@@ -265,6 +272,8 @@ class ChatRequest(BaseModel):
     tools: Optional[List[Dict]] = None
     tool_choice: Optional[Any] = None
     functions: Optional[List[Dict]] = None  # legacy OpenAI format
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
 
 
 # ─── Build Replicate Input ────────────────────────────────────────────────────
@@ -287,9 +296,33 @@ def _flatten_content(content: Any) -> str:
     return str(content)
 
 
+def _messages_to_prompt(messages_list: List[Dict], system_prompt: str) -> str:
+    """
+    Convert a messages array into a single prompt string.
+    Used for models like deepseek-ai/deepseek-v3 that only accept a flat prompt.
+    Format: <system>\n{system}\n</system>\n\nUser: ...\n\nAssistant: ...
+    """
+    parts = []
+    if system_prompt:
+        parts.append(f"<system>\n{system_prompt}\n</system>")
+    for m in messages_list:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "user":
+            parts.append(f"User: {content}")
+        elif role == "assistant":
+            parts.append(f"Assistant: {content}")
+        # system already handled above; tool/other roles become User lines
+        else:
+            parts.append(f"User: {content}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
 def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     is_anthropic = model_name.startswith("anthropic/")
+    is_prompt_only = model_name in _PROMPT_ONLY_MODELS
 
     # Normalize tools (support both tools[] and legacy functions[])
     tools = req.tools or []
@@ -380,6 +413,28 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
             payload["temperature"] = req.temperature
         if req.top_p is not None:
             payload["top_p"] = req.top_p
+
+    elif is_prompt_only:
+        # Models like deepseek-ai/deepseek-v3 only accept a flat prompt string.
+        # Convert messages → prompt, or pass through req.prompt directly.
+        if messages_list:
+            payload["prompt"] = _messages_to_prompt(messages_list, system_prompt)
+        elif req.prompt is not None:
+            prompt_text = req.prompt
+            if system_prompt:
+                prompt_text = f"<system>\n{system_prompt}\n</system>\n\n{prompt_text}"
+            payload["prompt"] = prompt_text
+        if req.max_tokens is not None:
+            payload["max_tokens"] = max(1, int(req.max_tokens))
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.top_p is not None:
+            payload["top_p"] = req.top_p
+        if req.presence_penalty is not None:
+            payload["presence_penalty"] = req.presence_penalty
+        if req.frequency_penalty is not None:
+            payload["frequency_penalty"] = req.frequency_penalty
+
     else:
         # OpenAI style
         if system_prompt:
@@ -396,6 +451,10 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
             payload["temperature"] = req.temperature
         if req.top_p is not None:
             payload["top_p"] = req.top_p
+        if req.presence_penalty is not None:
+            payload["presence_penalty"] = req.presence_penalty
+        if req.frequency_penalty is not None:
+            payload["frequency_penalty"] = req.frequency_penalty
 
     if req.image_input:
         payload["image_input"] = req.image_input
