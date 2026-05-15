@@ -64,7 +64,7 @@ TOOL_SYSTEM_PROMPT = """\
 You have access to external tools. When you need to call a tool, output ONLY a \
 JSON object in the following format — nothing else on that line:
 
-{"name": "<tool_name>", "arguments": {<key>: <value>, ...}}
+{{"name": "<tool_name>", "arguments": {{<key>: <value>, ...}}}}
 
 Rules:
 - Output one JSON object per tool call, on its own line.
@@ -77,7 +77,7 @@ Available tools (JSON Schema):
 {tools_json}
 
 Example — if you need to call "get_weather" with location "Paris":
-{"name": "get_weather", "arguments": {"location": "Paris"}}
+{{"name": "get_weather", "arguments": {{"location": "Paris"}}}}
 """
 
 
