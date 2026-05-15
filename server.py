@@ -812,11 +812,43 @@ async def anthropic_messages(
         def event_generator():
             msg_id = f"msg_{uuid.uuid4().hex}"
             try:
+                # ── Collect all chunks (same cumulative detection as /v1/chat/completions)
+                # replicate.stream() for some models (e.g. DeepSeek-v3) emits CUMULATIVE
+                # chunks where each chunk = full text so far. Forwarding each chunk raw
+                # produces repeated/duplicated text. We must detect the mode and extract
+                # the true final content before emitting SSE deltas.
+                raw_chunks: List[str] = []
+                for chunk in replicate.stream(model, input=replicate_input):
+                    raw_chunks.append(chunk if isinstance(chunk, str) else str(chunk))
+
+                # Detect cumulative vs incremental (same heuristic as /v1/chat/completions)
+                is_cumulative = False
+                n = len(raw_chunks)
+                if n >= 3:
+                    start = min(2, n - 2)
+                    sample_end = min(start + 5, n - 1)
+                    pairs = [(raw_chunks[i], raw_chunks[i + 1]) for i in range(start, sample_end)]
+                    valid_pairs = [(a, b) for a, b in pairs if len(a) >= 10]
+                    if valid_pairs:
+                        matches = sum(1 for a, b in valid_pairs if b.startswith(a))
+                        is_cumulative = matches >= max(1, len(valid_pairs) * 0.6)
+
+                if is_cumulative:
+                    content_acc = raw_chunks[-1] if raw_chunks else ""
+                    logger.debug("Anthropic stream — cumulative mode: %d chars", len(content_acc))
+                else:
+                    content_acc = "".join(raw_chunks)
+                    logger.debug("Anthropic stream — incremental mode: %d chunks, %d chars", n, len(content_acc))
+
+                # ── Emit proper Anthropic SSE events ──────────────────────
                 yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                for chunk in replicate.stream(model, input=replicate_input):
-                    token = chunk if isinstance(chunk, str) else str(chunk)
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': token}})}\n\n"
+                # Re-stream the clean content in small chunks so clients see incremental output
+                chunk_size = 20
+                for i in range(0, max(1, len(content_acc)), chunk_size):
+                    piece = content_acc[i:i + chunk_size]
+                    if piece:
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': piece}})}\n\n"
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                 yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
                 yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
