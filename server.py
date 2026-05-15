@@ -614,10 +614,34 @@ async def chat_completions(
     if req.stream:
         def event_generator():
             content_acc = ""
+            prev_len = 0          # tracks last emitted length for cumulative-output models
+            cumulative_mode = False   # flips True if we detect repetitive chunks
             try:
                 for chunk in replicate.stream(model, input=replicate_input):
-                    token = chunk if isinstance(chunk, str) else str(chunk)
-                    content_acc += token
+                    raw = chunk if isinstance(chunk, str) else str(chunk)
+
+                    # ── Detect cumulative vs incremental mode ──────────────────
+                    # Some Replicate models (e.g. DeepSeek, Llama via prompt input)
+                    # return the full text so far on every chunk instead of just
+                    # the new token. Detect this by checking whether the new chunk
+                    # starts with all previously accumulated content.
+                    if not cumulative_mode and content_acc and raw.startswith(content_acc):
+                        cumulative_mode = True
+                        prev_len = len(content_acc)  # already emitted this much
+                        logger.debug("Detected cumulative streaming mode for model %s", model)
+
+                    if cumulative_mode:
+                        # Only emit the new suffix
+                        token = raw[prev_len:]
+                        prev_len = len(raw)
+                        content_acc = raw          # content_acc = full text so far
+                    else:
+                        token = raw
+                        content_acc += token
+
+                    if not token:
+                        continue
+
                     data = {
                         "id": rid,
                         "object": "chat.completion.chunk",
