@@ -57,28 +57,103 @@ def resolve_model_id(m: Optional[str]) -> str:
 #
 # Strategy:
 #   1. Inject tool schemas into the system prompt with a clear format + examples.
-#   2. Parse the model output using 6 different heuristics (see parse_tool_calls).
+#   2. Parse the model output using multiple heuristics (see parse_tool_calls).
 #   3. Strip parsed blocks before returning content to the caller.
+#
+# Key improvements over naive regex approach:
+#   - _extract_json_objects() uses a brace-balanced iterative scan that correctly
+#     handles arbitrary nesting depth (e.g. skill_view args with nested dicts).
+#   - The old 2-level regex _JSON_OBJ missed deeply nested objects like
+#     {"name": "skill_view", "arguments": {"name": "camoufox", "options": {...}}}
+#   - parse_tool_calls no longer deduplicates by name — the same tool can be
+#     called multiple times in one response (e.g. two browser_navigate calls).
+#   - strip_tool_calls uses the same brace-balanced scanner so it removes exactly
+#     what was parsed, leaving no leftover JSON fragments.
 
 TOOL_SYSTEM_PROMPT = """\
-You have access to external tools. When you need to call a tool, output ONLY a \
-JSON object in the following format — nothing else on that line:
+You have access to external tools. When you need to use a tool, you MUST output \
+a JSON object on its own line using EXACTLY this format:
 
 {{"name": "<tool_name>", "arguments": {{<key>: <value>, ...}}}}
 
-Rules:
-- Output one JSON object per tool call, on its own line.
-- Do NOT wrap the JSON in markdown code fences.
-- Do NOT add prose before or after the JSON when calling a tool.
-- After you see the tool result, continue your answer normally.
-- If you don't need any tool, answer directly without any JSON.
+CRITICAL RULES:
+- Output the JSON on its OWN LINE with nothing else on that line.
+- Do NOT wrap in markdown code fences (no ```json).
+- Do NOT add any text before or after the JSON when calling a tool.
+- You MAY call multiple tools — one JSON object per line, each on its own line.
+- After receiving tool results (shown as [Tool result from '...']: ...), continue your answer normally.
+- If you do NOT need any tool, reply directly as normal text — no JSON at all.
 
 Available tools (JSON Schema):
 {tools_json}
 
-Example — if you need to call "get_weather" with location "Paris":
-{{"name": "get_weather", "arguments": {{"location": "Paris"}}}}
+Examples:
+Call skill_view:
+{{"name": "skill_view", "arguments": {{"name": "camoufox-cli"}}}}
+
+Call browser_navigate:
+{{"name": "browser_navigate", "arguments": {{"url": "https://example.com"}}}}
+
+Call a tool with nested arguments:
+{{"name": "web_search", "arguments": {{"query": "latest news", "count": 5}}}}
 """
+
+# Model-family-specific tool prompts appended after TOOL_SYSTEM_PROMPT.
+# These nudge known model families toward formats they were trained on.
+_LLAMA_TOOL_HINT = """
+For tool calls, you may also use this XML format if you prefer:
+<tool_call>
+{{"name": "<tool_name>", "arguments": {{...}}}}
+</tool_call>
+"""
+
+_QWEN_TOOL_HINT = """
+For tool calls, you may also use this format:
+<tool_call>
+{{"name": "<tool_name>", "arguments": {{...}}}}
+</tool_call>
+"""
+
+# Map model-id substring → extra hint to append
+_MODEL_TOOL_HINTS: List[tuple] = [
+    ("meta/llama",    _LLAMA_TOOL_HINT),
+    ("meta-llama",    _LLAMA_TOOL_HINT),
+    ("qwen",          _QWEN_TOOL_HINT),
+    ("qwen2",         _QWEN_TOOL_HINT),
+]
+
+# Models known to support image/vision input on Replicate
+_VISION_MODELS: set = {
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "openai/gpt-4-turbo",
+    "openai/gpt-5",
+    "openai/gpt-5.2",
+    "openai/gpt-5.4",
+    "anthropic/claude-3-5-sonnet",
+    "anthropic/claude-3-opus",
+    "anthropic/claude-3-sonnet",
+    "anthropic/claude-3-haiku",
+    "anthropic/claude-3-5-haiku",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "google/gemini-1.5-flash",
+    "google/gemini-1.5-pro",
+    "google/gemini-2.0-flash",
+    "google/gemini-2.5-pro",
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
+}
+
+
+def _model_supports_vision(model_id: str) -> bool:
+    """Return True if the Replicate model ID is known to support vision/image input."""
+    m = (model_id or "").lower()
+    for known in _VISION_MODELS:
+        if known.lower() in m:
+            return True
+    # Heuristic: model IDs containing 'vision' or 'vl' are likely vision-capable
+    return "vision" in m or "-vl" in m or "_vl" in m
 
 
 def _simplify_tools(tools: List[Dict]) -> List[Dict]:
@@ -98,10 +173,16 @@ def _simplify_tools(tools: List[Dict]) -> List[Dict]:
     return simplified
 
 
-def build_tool_system_prompt(tools: List[Dict]) -> str:
-    return TOOL_SYSTEM_PROMPT.format(
+def build_tool_system_prompt(tools: List[Dict], model_id: str = "") -> str:
+    base = TOOL_SYSTEM_PROMPT.format(
         tools_json=json.dumps(_simplify_tools(tools), indent=2)
     )
+    m = (model_id or "").lower()
+    for substr, hint in _MODEL_TOOL_HINTS:
+        if substr in m:
+            base = base + hint
+            break
+    return base
 
 
 def _try_parse_json(s: str) -> Optional[Dict]:
@@ -122,6 +203,55 @@ def _try_parse_json(s: str) -> Optional[Dict]:
     return None
 
 
+def _extract_json_objects(text: str) -> List[str]:
+    """
+    Extract all top-level JSON objects from *text* using a brace-balanced
+    iterative scanner.  Handles arbitrary nesting depth — unlike a regex
+    limited to 2 levels, this correctly extracts objects like:
+
+        {"name": "skill_view", "arguments": {"name": "x", "opts": {"k": 1}}}
+
+    Returns a list of raw JSON strings (may be valid or need light fixing).
+    """
+    results: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if escape_next:
+                escape_next = False
+                j += 1
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                j += 1
+                continue
+            if ch == '"':
+                in_string = not in_string
+            elif not in_string:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        results.append(text[i:j + 1])
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            # No closing brace found — skip this opening brace
+            i += 1
+    return results
+
+
 def _make_tool_call(data: Dict) -> Optional[Dict]:
     """
     Normalise a parsed dict into an OpenAI tool-call object.
@@ -131,6 +261,7 @@ def _make_tool_call(data: Dict) -> Optional[Dict]:
         {tool, arguments/parameters}
         {function_name, arguments/parameters}
         {tool_name, tool_input}    ← Anthropic-ish
+        {function: {name, arguments}}  ← OpenAI native style
     """
     # Resolve name
     fn_block = data.get("function")
@@ -144,12 +275,14 @@ def _make_tool_call(data: Dict) -> Optional[Dict]:
     if not name or not isinstance(name, str):
         return None
 
-    # Resolve arguments
+    # Resolve arguments — prefer explicit keys, fall back to nested function block
+    fn_args = fn_block.get("arguments") if isinstance(fn_block, dict) else None
     args = (
         data.get("arguments")
         or data.get("parameters")
         or data.get("tool_input")
         or data.get("input")
+        or fn_args
         or {}
     )
     if isinstance(args, str):
@@ -168,63 +301,117 @@ def _make_tool_call(data: Dict) -> Optional[Dict]:
     }
 
 
-# Regex that matches a JSON object with up to 2 levels of brace nesting.
-# Covers: {"name": "fn", "arguments": {"key": "val"}}
-# Pattern breakdown: \{ ... (\{ ... \} | non-brace)* ... \}
-_JSON_OBJ = r'\{(?:[^{}]|\{[^{}]*\})*\}'
-
-# Ordered list of extraction strategies (tried in sequence, first wins)
-_TOOL_CALL_PATTERNS: List[tuple] = [
-    # 1. <tool_call>...</tool_call> (our legacy format + Anthropic style)
-    ("xml_tool_call",      re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>",       re.DOTALL)),
-    # 2. <function_call>...</function_call>
-    ("xml_function_call",  re.compile(r"<function_call>\s*(.*?)\s*</function_call>", re.DOTALL)),
-    # 3. [TOOL_CALL] ... [/TOOL_CALL]
-    ("bracket_tool_call",  re.compile(r"\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]",   re.DOTALL)),
-    # 4. ```json ... ``` / ``` ... ``` code block
-    ("json_codeblock",     re.compile(r"```(?:json)?\s*(" + _JSON_OBJ + r")\s*```", re.DOTALL)),
-    # 5. Bare JSON object on its own line (handles nested braces e.g. "arguments": {...})
-    ("bare_json_line",     re.compile(r"^\s*(" + _JSON_OBJ + r")\s*$",              re.MULTILINE)),
+# XML tag patterns for tool-call formats that some models emit
+_XML_TAG_PATTERNS: List[tuple] = [
+    ("xml_tool_call",     re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>",       re.DOTALL)),
+    ("xml_function_call", re.compile(r"<function_call>\s*(.*?)\s*</function_call>", re.DOTALL)),
+    ("bracket_tool_call", re.compile(r"\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]",   re.DOTALL)),
 ]
+
+# Simple regex for ```json ... ``` fenced blocks (content extracted then brace-scanned)
+_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
 
 
 def parse_tool_calls(text: str) -> List[Dict]:
     """
     Extract tool calls from model output using multiple format heuristics.
     Returns a list of OpenAI-format tool_call objects.
+
+    Improvements over the old regex-only approach:
+    - Uses brace-balanced _extract_json_objects() for correct deep nesting.
+    - No dedup-by-name: same tool may be called multiple times.
+    - Tries XML tags first (most unambiguous), then code blocks, then bare JSON.
     """
     results: List[Dict] = []
-    seen_names: set = set()
+    # Track (name, arguments_json) pairs to avoid exact duplicates within
+    # the same response while still allowing the same tool with diff args.
+    seen_calls: set = set()
 
-    for strategy, pattern in _TOOL_CALL_PATTERNS:
+    def _add(tc: Optional[Dict], strategy: str) -> bool:
+        if tc is None:
+            return False
+        sig = (tc["function"]["name"], tc["function"]["arguments"])
+        if sig in seen_calls:
+            return False
+        seen_calls.add(sig)
+        results.append(tc)
+        logger.debug("Tool call detected via '%s': %s", strategy, tc["function"]["name"])
+        return True
+
+    # 1. XML / bracket tag patterns (highest confidence)
+    for strategy, pattern in _XML_TAG_PATTERNS:
         for raw in pattern.findall(text):
             raw = raw.strip()
-            data = _try_parse_json(raw)
-            if data is None:
-                continue
-            tc = _make_tool_call(data)
-            if tc is None:
-                continue
-            # Dedup by function name (same tool called once per response)
-            key = tc["function"]["name"]
-            if key not in seen_names:
-                seen_names.add(key)
-                results.append(tc)
-                logger.debug(f"Tool call detected via '{strategy}': {tc['function']['name']}")
+            # The content inside tags may itself contain a JSON object
+            for candidate in _extract_json_objects(raw) or [raw]:
+                data = _try_parse_json(candidate)
+                if data:
+                    _add(_make_tool_call(data), strategy)
+
+    # 2. ```json ... ``` fenced code blocks
+    for block in _CODEBLOCK_RE.findall(text):
+        for candidate in _extract_json_objects(block):
+            data = _try_parse_json(candidate)
+            if data:
+                _add(_make_tool_call(data), "json_codeblock")
+
+    # 3. Bare JSON objects anywhere in the text (brace-balanced scan)
+    #    Only accept objects that look like tool calls (have a 'name' key
+    #    matching a known tool-call shape) to avoid false positives from
+    #    JSON in prose.
+    for candidate in _extract_json_objects(text):
+        data = _try_parse_json(candidate)
+        if data is None:
+            continue
+        # Must have a resolvable 'name' field to be treated as a tool call
+        has_name = bool(
+            data.get("name") or data.get("tool") or data.get("tool_name")
+            or data.get("function_name")
+            or (isinstance(data.get("function"), dict) and data["function"].get("name"))
+        )
+        if not has_name:
+            continue
+        _add(_make_tool_call(data), "bare_json")
 
     return results
 
 
+def _is_tool_call_json(s: str) -> bool:
+    """Heuristic: does this JSON string look like a tool call (not arbitrary JSON)?"""
+    data = _try_parse_json(s)
+    if not isinstance(data, dict):
+        return False
+    return bool(
+        data.get("name") or data.get("tool") or data.get("tool_name")
+        or data.get("function_name")
+        or (isinstance(data.get("function"), dict) and data["function"].get("name"))
+    )
+
+
 def strip_tool_calls(text: str) -> str:
     """Remove all recognised tool-call blocks from the response text."""
-    # XML-style tags
+    # 1. XML-style tags
     text = re.sub(r"<tool_call>\s*.*?\s*</tool_call>", "", text, flags=re.DOTALL)
     text = re.sub(r"<function_call>\s*.*?\s*</function_call>", "", text, flags=re.DOTALL)
     text = re.sub(r"\[TOOL_CALL\]\s*.*?\s*\[/TOOL_CALL\]", "", text, flags=re.DOTALL)
-    # JSON code blocks
-    text = re.sub(r"```(?:json)?\s*" + _JSON_OBJ + r"\s*```", "", text, flags=re.DOTALL)
-    # Bare JSON lines that look like tool calls (handles nested braces)
-    text = re.sub(r"^\s*" + _JSON_OBJ + r"\s*$", "", text, flags=re.MULTILINE)
+
+    # 2. ```json ... ``` code blocks that contain tool calls
+    def _strip_codeblock(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        # Only strip if the block looks like a tool call
+        for candidate in _extract_json_objects(inner) or [inner]:
+            if _is_tool_call_json(candidate):
+                return ""
+        return m.group(0)  # keep non-tool-call code blocks
+    text = _CODEBLOCK_RE.sub(_strip_codeblock, text)
+
+    # 3. Bare JSON objects that are tool calls — replace each with empty string
+    #    using brace-balanced extraction so we don't strip normal JSON in prose.
+    for candidate in list(_extract_json_objects(text)):
+        if _is_tool_call_json(candidate):
+            # Replace the first exact occurrence
+            text = text.replace(candidate, "", 1)
+
     # Collapse multiple blank lines left behind
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -393,7 +580,7 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
 
     # Append tool schema to system prompt
     if tools:
-        system_parts.append(build_tool_system_prompt(tools))
+        system_parts.append(build_tool_system_prompt(tools, model_id=model_name))
 
     system_prompt = "\n\n".join(p for p in system_parts if p).strip()
 
@@ -457,7 +644,51 @@ def build_replicate_input(req: ChatRequest, model_name: str) -> Dict[str, Any]:
             payload["frequency_penalty"] = req.frequency_penalty
 
     if req.image_input:
-        payload["image_input"] = req.image_input
+        if _model_supports_vision(model_name):
+            # For vision-capable models, inject images as OpenAI-style image_url parts
+            # into the last user message so the model can see them natively.
+            import base64, mimetypes
+            image_parts: List[Dict] = []
+            for img in req.image_input:
+                if img.startswith("data:"):
+                    # Already a data URL — pass through as-is
+                    image_parts.append({"type": "image_url", "image_url": {"url": img}})
+                elif img.startswith("http://") or img.startswith("https://"):
+                    image_parts.append({"type": "image_url", "image_url": {"url": img}})
+                else:
+                    # Treat as local file path — encode to base64 data URL
+                    try:
+                        import pathlib
+                        raw = pathlib.Path(img).read_bytes()
+                        mime, _ = mimetypes.guess_type(img)
+                        mime = mime or "image/jpeg"
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        data_url = f"data:{mime};base64,{b64}"
+                        image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+                    except Exception as exc:
+                        logger.warning("image_input: failed to encode %s — %s", img, exc)
+
+            if image_parts and "messages" in payload and isinstance(payload["messages"], list):
+                # Find last user message and append image parts to its content
+                for msg in reversed(payload["messages"]):
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        existing = msg.get("content", "")
+                        if isinstance(existing, str):
+                            content_parts: List[Dict] = [{"type": "text", "text": existing}]
+                        elif isinstance(existing, list):
+                            content_parts = list(existing)
+                        else:
+                            content_parts = []
+                        content_parts.extend(image_parts)
+                        msg["content"] = content_parts
+                        break
+            elif image_parts:
+                # Fallback: pass as image_input field for models that accept it
+                payload["image_input"] = req.image_input
+        else:
+            # Non-vision model: keep legacy image_input passthrough
+            payload["image_input"] = req.image_input
+
     if req.reasoning_effort:
         payload["reasoning_effort"] = req.reasoning_effort
     if req.verbosity:
