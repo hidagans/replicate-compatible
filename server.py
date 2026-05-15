@@ -613,35 +613,46 @@ async def chat_completions(
     # ── Streaming ──────────────────────────────────────────────────────────
     if req.stream:
         def event_generator():
-            content_acc = ""
-            prev_len = 0          # tracks last emitted length for cumulative-output models
-            cumulative_mode = False   # flips True if we detect repetitive chunks
             try:
+                # ── Collect all chunks from Replicate ─────────────────────
+                # replicate.stream() has two behaviors depending on model:
+                #   Incremental: each chunk = new token only  (OpenAI-style)
+                #   Cumulative : each chunk = full text so far (DeepSeek etc.)
+                #
+                # Cumulative mode is unreliable to detect mid-stream because
+                # chunks can go backward in length between iterations.
+                # Safest strategy: collect ALL chunks, then deduplicate.
+                raw_chunks: List[str] = []
                 for chunk in replicate.stream(model, input=replicate_input):
-                    raw = chunk if isinstance(chunk, str) else str(chunk)
+                    raw_chunks.append(chunk if isinstance(chunk, str) else str(chunk))
 
-                    # ── Detect cumulative vs incremental mode ──────────────────
-                    # Some Replicate models (e.g. DeepSeek, Llama via prompt input)
-                    # return the full text so far on every chunk instead of just
-                    # the new token. Detect this by checking whether the new chunk
-                    # starts with all previously accumulated content.
-                    if not cumulative_mode and content_acc and raw.startswith(content_acc):
-                        cumulative_mode = True
-                        prev_len = len(content_acc)  # already emitted this much
-                        logger.debug("Detected cumulative streaming mode for model %s", model)
-
-                    if cumulative_mode:
-                        # Only emit the new suffix
-                        token = raw[prev_len:]
-                        prev_len = len(raw)
-                        content_acc = raw          # content_acc = full text so far
+                # Determine the true final content:
+                # If cumulative, the longest chunk IS the full text.
+                # If incremental, joining all gives the full text.
+                # We take the longest chunk; if it equals join → incremental,
+                # otherwise longest is the canonical full response.
+                if raw_chunks:
+                    joined = "".join(raw_chunks)
+                    longest = max(raw_chunks, key=len)
+                    # Heuristic: if any single chunk is ≥ 80% of the joined
+                    # length AND contains most of it, treat as cumulative.
+                    if len(longest) >= 0.8 * len(joined) and joined.startswith(longest[:min(20, len(longest))]):
+                        content_acc = longest
+                        logger.debug("Cumulative stream mode: using longest chunk (%d chars)", len(content_acc))
                     else:
-                        token = raw
-                        content_acc += token
+                        content_acc = joined
+                        logger.debug("Incremental stream mode: joined %d chunks (%d chars)", len(raw_chunks), len(content_acc))
+                else:
+                    content_acc = ""
 
-                    if not token:
-                        continue
+                # ── Post-process tool calls ────────────────────────────────
+                tool_calls = parse_tool_calls(content_acc) if has_tools else []
+                clean_content = strip_tool_calls(content_acc) if tool_calls else content_acc
 
+                # ── Re-stream to client as proper SSE deltas ───────────────
+                # Emit the full content as a single delta so the client
+                # never sees partial/repeated content.
+                if clean_content:
                     data = {
                         "id": rid,
                         "object": "chat.completion.chunk",
@@ -650,19 +661,14 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"role": "assistant", "content": token},
+                                "delta": {"role": "assistant", "content": clean_content},
                                 "finish_reason": None,
                             }
                         ],
                     }
                     yield f"data: {json.dumps(data)}\n\n"
 
-                # Post-process: detect tool calls in the accumulated response
-                tool_calls = parse_tool_calls(content_acc) if has_tools else []
-                clean_content = strip_tool_calls(content_acc) if tool_calls else content_acc
-
                 if tool_calls:
-                    # Emit tool_calls chunks in OpenAI streaming format
                     for i, tc in enumerate(tool_calls):
                         tc_chunk = {
                             "id": rid,
@@ -674,7 +680,7 @@ async def chat_completions(
                                     "index": 0,
                                     "delta": {
                                         "role": "assistant",
-                                        "content": clean_content if i == 0 else None,
+                                        "content": None,
                                         "tool_calls": [
                                             {
                                                 "index": i,
@@ -693,15 +699,12 @@ async def chat_completions(
                         }
                         yield f"data: {json.dumps(tc_chunk)}\n\n"
 
-                    # Final chunk with finish_reason=tool_calls
                     fin = {
                         "id": rid,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                        ],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     }
                     yield f"data: {json.dumps(fin)}\n\n"
                 else:
@@ -710,9 +713,7 @@ async def chat_completions(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}
-                        ],
+                        "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}],
                     }
                     yield f"data: {json.dumps(fin)}\n\n"
 
