@@ -301,21 +301,140 @@ def get_replicate_token(request: Request):
     return api_token
 
 
+# ─── Helper: build model list ─────────────────────────────────────────────────
+
+def _build_model_list() -> list:
+    now = int(time.time())
+    models = []
+    # Primary model
+    primary_id = resolve_model_id(None)
+    models.append({
+        "id": primary_id,
+        "object": "model",
+        "created": now,
+        "owned_by": "replicate",
+        "context_length": 128000,
+        "max_context_length": 128000,
+        "max_completion_tokens": 16384,
+        "max_tokens": 16384,
+    })
+    # Mapped aliases — expose both the alias AND the resolved replicate model ID
+    seen = {primary_id}
+    for alias, replicate_id in MODEL_MAP.items():
+        for mid in (alias, replicate_id):
+            if mid not in seen:
+                seen.add(mid)
+                models.append({
+                    "id": mid,
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "replicate",
+                    "context_length": 128000,
+                    "max_context_length": 128000,
+                    "max_completion_tokens": 16384,
+                    "max_tokens": 16384,
+                })
+    return models
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
-@app.get("/v1/models")
-def list_models(_: Any = Depends(get_replicate_token)):
-    model_id = resolve_model_id(None)
-    data = {
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "replicate"},
-        ],
-    }
-    for k in MODEL_MAP:
-        data["data"].append({"id": k, "object": "model", "created": int(time.time()), "owned_by": "mapping"})
-    return JSONResponse(data)
+# ── OpenAI-compatible model listing ──────────────────────────────────────────
 
+@app.get("/v1/models")
+def list_models_v1(_: Any = Depends(get_replicate_token)):
+    """OpenAI-style GET /v1/models — used by Hermes for model validation."""
+    return JSONResponse({"object": "list", "data": _build_model_list()})
+
+
+@app.get("/v1/models/{model_id:path}")
+def get_model_v1(model_id: str, _: Any = Depends(get_replicate_token)):
+    """OpenAI-style GET /v1/models/{id} — used by Hermes to probe individual models."""
+    now = int(time.time())
+    resolved = resolve_model_id(model_id)
+    return JSONResponse({
+        "id": model_id,
+        "object": "model",
+        "created": now,
+        "owned_by": "replicate",
+        "context_length": 128000,
+        "max_context_length": 128000,
+        "max_completion_tokens": 16384,
+        "max_tokens": 16384,
+        "replicate_model": resolved,
+    })
+
+
+# ── Ollama-compatible endpoints ───────────────────────────────────────────────
+
+@app.get("/api/tags")
+def ollama_tags():
+    """Ollama GET /api/tags — Hermes probes this to detect Ollama servers."""
+    # Return empty list so Hermes doesn't mis-detect this as Ollama
+    # (Ollama returns {"models": [...]}, non-Ollama servers return 404/other)
+    # We return a valid but empty response so the 404 error goes away,
+    # but the "models" key being absent means Hermes won't think it's Ollama.
+    return JSONResponse({"server": "replicate-compatible", "tags": []})
+
+
+# ── LM Studio-compatible endpoints ───────────────────────────────────────────
+
+@app.get("/api/v1/models")
+def lmstudio_models(_: Any = Depends(get_replicate_token)):
+    """LM Studio native GET /api/v1/models — Hermes probes this to detect LM Studio."""
+    # Return a response without the "models" key structure that LM Studio uses,
+    # so Hermes won't mis-detect this as LM Studio. Just 200 OK to avoid 404 noise.
+    now = int(time.time())
+    return JSONResponse({
+        "server": "replicate-compatible",
+        "models": [],  # empty — prevents mis-detection as LM Studio
+    })
+
+
+# ── llama.cpp-compatible endpoints ───────────────────────────────────────────
+
+@app.get("/v1/props")
+def llama_props_v1():
+    """llama.cpp GET /v1/props — Hermes probes this to detect llama.cpp servers."""
+    # Do NOT include "default_generation_settings" — that's the key Hermes
+    # checks for. Return something benign so we're not mis-detected as llamacpp.
+    return JSONResponse({
+        "server": "replicate-compatible",
+        "version": "1.0.0",
+    })
+
+
+@app.get("/props")
+def llama_props():
+    """llama.cpp fallback GET /props (older builds)."""
+    return JSONResponse({
+        "server": "replicate-compatible",
+        "version": "1.0.0",
+    })
+
+
+# ── vLLM / generic version endpoint ──────────────────────────────────────────
+
+@app.get("/version")
+def server_version():
+    """Generic GET /version — vLLM style. Hermes probes this to detect vLLM."""
+    # Do NOT include a bare "version" key with a semver string alone,
+    # because Hermes checks `if "version" in data` to classify as vLLM.
+    # Return it nested so detection fails gracefully (no mis-classification).
+    return JSONResponse({
+        "server": "replicate-compatible",
+        "server_version": "1.0.0",
+    })
+
+
+# ── Health endpoint ───────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ── Main chat endpoints ───────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(get_replicate_token)):
@@ -353,7 +472,6 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
                 clean_content = strip_tool_calls(content_acc) if tool_calls else content_acc
 
                 if tool_calls:
-                    # Send tool_calls in final chunk
                     tc_data = {
                         "id": rid, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -408,7 +526,7 @@ async def chat_completions(req: ChatRequest, request: Request, _: Any = Depends(
                 "message": {
                     "role": "assistant",
                     "content": clean_content,
-                    **({"tool_calls": tool_calls} if tool_calls else {}),
+                    **({" tool_calls": tool_calls} if tool_calls else {}),
                 },
                 "finish_reason": finish_reason,
             }],
@@ -455,11 +573,6 @@ async def anthropic_messages(req: ChatRequest, request: Request, _: Any = Depend
         except Exception as e:
             logger.exception("Anthropic run error")
             raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 
 @app.middleware("http")
