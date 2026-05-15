@@ -626,21 +626,37 @@ async def chat_completions(
                 for chunk in replicate.stream(model, input=replicate_input):
                     raw_chunks.append(chunk if isinstance(chunk, str) else str(chunk))
 
-                # Determine the true final content:
-                # If cumulative, the longest chunk IS the full text.
-                # If incremental, joining all gives the full text.
-                # We take the longest chunk; if it equals join → incremental,
-                # otherwise longest is the canonical full response.
+                # ── Detect cumulative vs incremental stream ───────────────
+                # Cumulative : each chunk = full response so far (DeepSeek etc.)
+                #              → final content = LAST chunk
+                # Incremental: each chunk = new tokens only (OpenAI-style)
+                #              → final content = JOIN all chunks
+                #
+                # Detection strategy:
+                #   In cumulative mode, chunk[i] is always a prefix of chunk[i+1].
+                #   We sample pairs from the MIDDLE of the stream (not the start,
+                #   where chunks can be very short and cause false positives).
+                #   Require the prefix chunk to be ≥ 10 chars to count.
                 if raw_chunks:
-                    joined = "".join(raw_chunks)
-                    longest = max(raw_chunks, key=len)
-                    # Heuristic: if any single chunk is ≥ 80% of the joined
-                    # length AND contains most of it, treat as cumulative.
-                    if len(longest) >= 0.8 * len(joined) and joined.startswith(longest[:min(20, len(longest))]):
-                        content_acc = longest
-                        logger.debug("Cumulative stream mode: using longest chunk (%d chars)", len(content_acc))
+                    n = len(raw_chunks)
+                    is_cumulative = False
+
+                    if n >= 3:
+                        # Skip the first couple of chunks (too short, unreliable)
+                        start = min(2, n - 2)
+                        sample_end = min(start + 5, n - 1)
+                        pairs = [(raw_chunks[i], raw_chunks[i + 1]) for i in range(start, sample_end)]
+                        # Only count pairs where the prefix chunk is meaningful (≥10 chars)
+                        valid_pairs = [(a, b) for a, b in pairs if len(a) >= 10]
+                        if valid_pairs:
+                            matches = sum(1 for a, b in valid_pairs if b.startswith(a))
+                            is_cumulative = matches >= max(1, len(valid_pairs) * 0.6)
+
+                    if is_cumulative:
+                        content_acc = raw_chunks[-1]
+                        logger.debug("Cumulative stream mode: using last chunk (%d chars)", len(content_acc))
                     else:
-                        content_acc = joined
+                        content_acc = "".join(raw_chunks)
                         logger.debug("Incremental stream mode: joined %d chunks (%d chars)", len(raw_chunks), len(content_acc))
                 else:
                     content_acc = ""
